@@ -139,9 +139,19 @@ export class E2EE {
 						error instanceof InternalError &&
 						error.data.code == "NOT_FOUND"
 					) {
-						e2eeGroupSharedKey = await this.tryRegisterE2EEGroupKey(
-							mid,
+						// No group key on server — register a fresh one.
+						this.e2eeLog("getE2EELocalPublicKeyGroupKeyNotFound", { mid });
+						await this.tryRegisterE2EEGroupKey(mid);
+						const cached = await this.client.storage.get(
+							`e2eeGroupKeys:${mid}`,
 						);
+						if (!cached) {
+							throw new InternalError(
+								"NoE2EEKey",
+								`E2EE group key cache missing after registration for ${mid}`,
+							);
+						}
+						return JSON.parse(cached as string);
 					} else {
 						throw error;
 					}
@@ -153,10 +163,83 @@ export class E2EE {
 				const encryptedSharedKey = Buffer.from(
 					e2eeGroupSharedKey.encryptedSharedKey,
 				);
+
+				this.e2eeLog("getE2EEGroupSharedKeyResponse", {
+					mid,
+					groupKeyId,
+					creator,
+					creatorKeyId,
+					receiverKeyId,
+					encryptedSharedKeyLen: encryptedSharedKey.length,
+				});
+				console.log(`[e2ee-diag] groupKey server response: mid=${mid} groupKeyId=${groupKeyId} creator=${creator} creatorKeyId=${creatorKeyId} receiverKeyId=${receiverKeyId} encLen=${encryptedSharedKey.length}`);
+
+				// If the group shared key was encrypted for an old key we
+				// no longer have (e.g. after QR secondary-device login),
+				// re-register the group key using current keys.
+				// tryRegisterE2EEGroupKey caches the plaintext directly,
+				// so we can return it without needing to decrypt.
+				let selfKeyForGroup = await this.getE2EESelfKeyDataByKeyId(
+					receiverKeyId,
+				);
+				if (!selfKeyForGroup && this.client.profile?.mid) {
+					// receiverKeyId not found locally. Check if it's the same
+					// key material under a different keyId (server reassigned
+					// keyId) vs a genuinely different keypair (QR re-login).
+					const selfByMid = await this.getE2EESelfKeyData(
+						this.client.profile.mid,
+					);
+					if (selfByMid) {
+						try {
+							const nego = await this.client.talk.negotiateE2EEPublicKey(
+								{ mid: this.client.profile.mid },
+							);
+							const serverPubKey = Buffer.from(nego.publicKey.keyData).toString("base64");
+							const serverKeyId = nego.publicKey.keyId;
+							const localPubKey = selfByMid.pubKey;
+							const pubMatch = localPubKey === serverPubKey;
+							console.log(`[e2ee-diag] alias check: receiverKeyId=${receiverKeyId} serverKeyId=${serverKeyId} localKeyId=${selfByMid.keyId} pubMatch=${pubMatch}`);
+							if (pubMatch && serverKeyId === receiverKeyId) {
+								// Same key material, server just uses a different keyId
+								// than what we stored locally. Safe to alias.
+								const aliased = { ...selfByMid, keyId: String(receiverKeyId) };
+								await this.saveE2EESelfKeyDataByKeyId(receiverKeyId, aliased);
+								selfKeyForGroup = aliased;
+								console.log(`[e2ee-diag] alias created: e2eeKeys:${receiverKeyId} (local was ${selfByMid.keyId})`);
+							}
+							// else: pubKey mismatch or receiverKeyId != server current
+							// → fall through to re-registration
+						} catch (negoErr) {
+							console.log(`[e2ee-diag] negotiateE2EEPublicKey failed during alias check: ${String(negoErr)}`);
+							// Network error → fall through to re-registration
+						}
+					}
+				}
+				if (!selfKeyForGroup) {
+					// Group key is encrypted for a key we can't use.
+					// Re-register with current keys.
+					this.e2eeLog(
+						"getE2EELocalPublicKeyReceiverKeyMismatch",
+						{ receiverKeyId, mid },
+					);
+					console.log(`[e2ee-diag] no valid self key for receiverKeyId=${receiverKeyId}, re-registering group key for ${mid}`);
+					await this.tryRegisterE2EEGroupKey(mid);
+					const cached = await this.client.storage.get(
+						`e2eeGroupKeys:${mid}`,
+					);
+					if (!cached) {
+						throw new InternalError(
+							"NoE2EEKey",
+							`E2EE group key cache missing after re-registration for ${mid}`,
+						);
+					}
+					return JSON.parse(cached as string);
+				}
+
+				// Normal path — we have the right self key, decrypt the
+				// server-provided group shared key.
 				const selfKey = Buffer.from(
-					(await this.getE2EESelfKeyDataByKeyId(
-						receiverKeyId,
-					))["privKey"],
+					selfKeyForGroup["privKey"],
 					"base64",
 				);
 				const creatorKey = await this.getE2EELocalPublicKey(
@@ -178,25 +261,46 @@ export class E2EE {
 					aes_iv,
 					encryptedSharedKey,
 				});
-				const decipher = crypto.createDecipheriv(
-					"aes-256-cbc",
-					aes_key,
-					aes_iv,
-				);
-				const plainText = Buffer.concat([
-					decipher.update(encryptedSharedKey),
-					decipher.final(),
-				]);
-				this.e2eeLog(
-					"getE2EELocalPublicKeyDecryptedLength",
-					plainText.length,
-				);
-				const decrypted = plainText.toString("base64");
-				this.e2eeLog("getE2EELocalPublicKeyDecrypted", decrypted);
-				const data = {
-					privKey: decrypted,
-					keyId: groupKeyId,
-				};
+
+				let data: { privKey: string; keyId: number };
+				try {
+					const decipher = crypto.createDecipheriv(
+						"aes-256-cbc",
+						aes_key,
+						aes_iv,
+					);
+					const plainText = Buffer.concat([
+						decipher.update(encryptedSharedKey),
+						decipher.final(),
+					]);
+					this.e2eeLog(
+						"getE2EELocalPublicKeyDecryptedLength",
+						plainText.length,
+					);
+					const decrypted = plainText.toString("base64");
+					this.e2eeLog("getE2EELocalPublicKeyDecrypted", decrypted);
+					data = {
+						privKey: decrypted,
+						keyId: groupKeyId,
+					};
+				} catch (decryptErr) {
+					// Decryption failed — server's group key is encrypted with
+					// bad/outdated key material. Re-register to fix it.
+					this.e2eeLog("getE2EELocalPublicKeyDecryptFailed", {
+						error: String(decryptErr), mid, groupKeyId, creator, creatorKeyId, receiverKeyId,
+					});
+					await this.tryRegisterE2EEGroupKey(mid);
+					const cached = await this.client.storage.get(
+						`e2eeGroupKeys:${mid}`,
+					);
+					if (!cached) {
+						throw new InternalError(
+							"NoE2EEKey",
+							`E2EE group key cache missing after decrypt-failure re-registration for ${mid}`,
+						);
+					}
+					return JSON.parse(cached as string);
+				}
 				key = JSON.stringify(data);
 				await this.client.storage.set(`e2eeGroupKeys:${mid}`, key);
 				return data;
@@ -214,7 +318,17 @@ export class E2EE {
 		const keyIds: number[] = [];
 		const encryptedSharedKeys: Buffer[] = [];
 		const selfKeyId = e2eePublicKeys[this.client.profile!.mid].keyId;
-		const selfKeyData = await this.getE2EESelfKeyDataByKeyId(selfKeyId);
+		let selfKeyData = await this.getE2EESelfKeyDataByKeyId(selfKeyId);
+		if (!selfKeyData && this.client.profile?.mid) {
+			// Server keyId differs from local. Try finding key by mid.
+			const selfByMid = await this.getE2EESelfKeyData(this.client.profile.mid);
+			if (selfByMid) {
+				console.log(`[e2ee-diag] tryRegisterE2EEGroupKey: e2eeKeys:${selfKeyId} not found, found by mid (local keyId=${selfByMid.keyId}). Creating alias.`);
+				const aliased = { ...selfByMid, keyId: String(selfKeyId) };
+				await this.saveE2EESelfKeyDataByKeyId(selfKeyId, aliased);
+				selfKeyData = aliased;
+			}
+		}
 		if (!selfKeyData) {
 			throw new InternalError(
 				"NoE2EEKey",
@@ -250,13 +364,30 @@ export class E2EE {
 				encryptedSharedKeys.push(encryptedSharedKey);
 			}
 		}
-		return this.client.talk.registerE2EEGroupKey({
+		const response = await this.client.talk.registerE2EEGroupKey({
 			keyVersion: 1,
 			chatMid,
 			keyIds,
 			members,
 			encryptedSharedKeys,
 		});
+		// Cache the plaintext group key immediately.
+		// We generated private_key ourselves, so we know the plaintext —
+		// no need to decrypt the server response (which may not include
+		// a valid encryptedSharedKey for us).
+		const groupKeyData = {
+			privKey: private_key.toString("base64"),
+			keyId: response.groupKeyId,
+		};
+		await this.client.storage.set(
+			`e2eeGroupKeys:${chatMid}`,
+			JSON.stringify(groupKeyData),
+		);
+		this.e2eeLog("tryRegisterE2EEGroupKeyCached", {
+			chatMid,
+			groupKeyId: response.groupKeyId,
+		});
+		return response;
 	}
 	public generateSharedSecret(
 		privateKey: Buffer,
@@ -309,6 +440,7 @@ export class E2EE {
 		| { keyId: LooseType; privKey: Buffer; pubKey: Buffer; e2eeVersion: LooseType }
 		| undefined
 	> {
+		console.log(`[e2ee-qr] decodeE2EEKeyV1 RAW e2eeInfo: keyId=${data.keyId} e2eeVersion=${data.e2eeVersion} hasEncryptedKeyChain=${!!data.encryptedKeyChain} publicKey=${data.publicKey?.slice(0, 30)}... allFields=${JSON.stringify(Object.keys(data))}`);
 		if (data.encryptedKeyChain) {
 			const encryptedKeyChain = Buffer.from(
 				data.encryptedKeyChain,
@@ -317,11 +449,15 @@ export class E2EE {
 			const keyId = data.keyId;
 			const publicKey = Buffer.from(data.publicKey, "base64");
 			const e2eeVersion = data.e2eeVersion;
-			const [privKey, pubKey] = this.decryptKeyChain(
+			console.log(`[e2ee-qr] decodeE2EEKeyV1: keyId=${keyId} e2eeVersion=${e2eeVersion} phonePubKeyLen=${publicKey.length} encKeychainLen=${encryptedKeyChain.length} secretLen=${secret.length}`);
+			const keychainResult = this.decryptKeyChain(
 				publicKey,
 				secret,
 				encryptedKeyChain,
+				keyId,
 			);
+			const [privKey, pubKey] = keychainResult.matched;
+
 			this.e2eeLog("decodeE2EEKeyV1E2EEKeyInfo", {
 				e2eeKey: {
 					keyId,
@@ -330,15 +466,56 @@ export class E2EE {
 					e2eeVersion,
 				},
 			});
-			await this.client.storage.set(
-				"e2eeKeys:" + keyId,
-				JSON.stringify({
-					keyId,
-					privKey: privKey.toString("base64"),
-					pubKey: pubKey.toString("base64"),
+			console.log(`[e2ee-diag] QR login received key: keyId=${keyId} privKey=${privKey.toString("base64")} pubKey=${pubKey.toString("base64")} e2eeVersion=${e2eeVersion}`);
+
+			// Save ALL keys from the keychain (not just the matched one).
+			// Historical messages may be encrypted with older keyIds — we need
+			// all of them in storage for getChatHistory E2EE decrypt to work.
+			console.log(`[e2ee-qr] saving ${keychainResult.allEntries.length} keys from keychain`);
+			for (const entry of keychainResult.allEntries) {
+				const entryJson = JSON.stringify({
+					keyId: entry.keyId,
+					privKey: entry.privKey.toString("base64"),
+					pubKey: entry.pubKey.toString("base64"),
 					e2eeVersion,
-				}),
-			);
+				});
+				await this.client.storage.set("e2eeKeys:" + entry.keyId, entryJson);
+				console.log(`[e2ee-qr] saved e2eeKeys:${entry.keyId}`);
+			}
+
+			// Also update the mid-based cache with the current (matched) key
+			// so getE2EESelfKeyData doesn't return stale data.
+			const keyJson = JSON.stringify({
+				keyId,
+				privKey: privKey.toString("base64"),
+				pubKey: pubKey.toString("base64"),
+				e2eeVersion,
+			});
+			if (this.client.profile?.mid) {
+				await this.client.storage.set("e2eeKeys:" + this.client.profile.mid, keyJson);
+				console.log(`[e2ee-diag] QR login also updated e2eeKeys:${this.client.profile.mid}`);
+			}
+			const savedBack = await this.client.storage.get("e2eeKeys:" + keyId);
+			console.log(`[e2ee-diag] QR login saved to DB: e2eeKeys:${keyId} verified=${savedBack === keyJson}`);
+			// Immediately verify against server
+			try {
+				const nego = await this.client.talk.negotiateE2EEPublicKey(
+					{ mid: this.client.profile?.mid || "" },
+				);
+				const serverPubKey = Buffer.from(nego.publicKey.keyData).toString("base64");
+				const serverKeyId = nego.publicKey.keyId;
+				const localPubKey = pubKey.toString("base64");
+				const pubMatch = localPubKey === serverPubKey;
+				console.log(`[e2ee-qr] POST-LOGIN SERVER CHECK: localKeyId=${keyId} serverKeyId=${serverKeyId} pubMatch=${pubMatch}`);
+				if (!pubMatch) {
+					console.log(`[e2ee-qr] MISMATCH! local=${localPubKey.slice(0, 30)}... server=${serverPubKey.slice(0, 30)}...`);
+					console.log(`[e2ee-qr] server specVersion=${nego.specVersion} server keyData full=${serverPubKey}`);
+				} else {
+					console.log(`[e2ee-qr] OK: keychain pubKey matches server`);
+				}
+			} catch (negoErr) {
+				console.log(`[e2ee-qr] POST-LOGIN SERVER CHECK failed: ${String(negoErr)}`);
+			}
 			return {
 				keyId,
 				privKey,
@@ -351,7 +528,9 @@ export class E2EE {
 		publicKey: Buffer,
 		privateKey: Buffer,
 		encryptedKeyChain: Buffer,
-	): Buffer[] {
+		targetKeyId: number | string,
+	): { matched: [Buffer, Buffer]; allEntries: Array<{ keyId: number; privKey: Buffer; pubKey: Buffer }> } {
+		console.log(`[e2ee-qr] decryptKeyChain INPUT: phonePubKey=${publicKey.toString("base64").slice(0, 20)}... botSecretKey=${privateKey.toString("base64").slice(0, 20)}... encKeychainLen=${encryptedKeyChain.length} targetKeyId=${targetKeyId}`);
 		this.e2eeLog("decryptKeyChainKeyInfo", {
 			decryptKeyChain: {
 				publicKey: publicKey.toString("base64"),
@@ -360,6 +539,7 @@ export class E2EE {
 			},
 		});
 		const sharedSecret = this.generateSharedSecret(privateKey, publicKey);
+		console.log(`[e2ee-qr] decryptKeyChain ECDH sharedSecret=${Buffer.from(sharedSecret).toString("base64").slice(0, 20)}...`);
 		const aesKey = this.getSHA256Sum(Buffer.from(sharedSecret), "Key");
 		const aesIv = this.xor(
 			this.getSHA256Sum(Buffer.from(sharedSecret), "IV"),
@@ -370,13 +550,61 @@ export class E2EE {
 			decipher.update(encryptedKeyChain),
 			decipher.final(),
 		]);
+		console.log(`[e2ee-qr] decryptKeyChain CBC decrypted: len=${keychainData.length} hex=${keychainData.toString("hex").slice(0, 80)}...`);
 		this.e2eeLog("decryptKeyChainBinKeyInfo", {
 			binkey: keychainData.toString("hex"),
 		});
-		const key = this.client.thrift.readThriftStruct(keychainData)[1];
-		const publicKeyBytes = Buffer.from(key[0][4]);
-		const privateKeyBytes = Buffer.from(key[0][5]);
-		return [privateKeyBytes, publicKeyBytes];
+		const thriftParsed = this.client.thrift.readThriftStruct(keychainData);
+		console.log(`[e2ee-qr] decryptKeyChain thrift keys: ${JSON.stringify(Object.keys(thriftParsed))}`);
+		const keyEntries = thriftParsed[1];
+		const entryKeys = Object.keys(keyEntries ?? {});
+		console.log(`[e2ee-qr] decryptKeyChain thrift[1] entry count: ${entryKeys.length} keys: ${JSON.stringify(entryKeys)}`);
+
+		// Parse ALL entries and find the one matching targetKeyId
+		const targetKeyIdNum = Number(targetKeyId);
+		let matchedIdx: string | null = null;
+		const allEntries: Array<{ keyId: number; privKey: Buffer; pubKey: Buffer }> = [];
+
+		for (const idx of entryKeys) {
+			const entry = keyEntries[idx];
+			const entryFieldKeys = Object.keys(entry ?? {});
+			// field 1 = version (number), field 2 = keyId (number), field 4 = pubKey (buffer), field 5 = privKey (buffer)
+			const entryKeyId = entry[2];
+			const entryPub = (entry[4] && typeof entry[4] !== "number") ? Buffer.from(entry[4]).toString("base64") : String(entry[4]);
+			console.log(`[e2ee-qr] decryptKeyChain entry[${idx}]: fields=${JSON.stringify(entryFieldKeys)} keyId=${entryKeyId} pubKey=${typeof entry[4] !== "number" ? entryPub.slice(0, 30) + "..." : "N/A"}`);
+
+			if (entry[4] && entry[5]) {
+				// field 4 = pubKey, field 5 = privKey (same order as matched return)
+				allEntries.push({
+					keyId: Number(entryKeyId),
+					privKey: Buffer.from(entry[5]),
+					pubKey: Buffer.from(entry[4]),
+				});
+			} else {
+				console.error(`[e2ee-qr] decryptKeyChain entry[${idx}] keyId=${entryKeyId} SKIPPED: missing pubKey(field4) or privKey(field5)`);
+			}
+
+			if (Number(entryKeyId) === targetKeyIdNum) {
+				matchedIdx = idx;
+				console.log(`[e2ee-qr] decryptKeyChain entry[${idx}] MATCHED targetKeyId=${targetKeyId}`);
+			}
+		}
+
+		if (!matchedIdx) {
+			console.log(`[e2ee-qr] decryptKeyChain WARNING: no entry matched targetKeyId=${targetKeyId}, falling back to entry[0]`);
+			matchedIdx = "0";
+		}
+
+		const chosenEntry = keyEntries[matchedIdx];
+		if (!chosenEntry || !chosenEntry[4] || !chosenEntry[5]) {
+			console.log(`[e2ee-qr] decryptKeyChain FATAL: chosen entry[${matchedIdx}] missing pubKey(field4) or privKey(field5): ${JSON.stringify(Object.keys(chosenEntry ?? {}))}`);
+			throw new Error(`decryptKeyChain: entry[${matchedIdx}] missing key fields`);
+		}
+		const publicKeyBytes = Buffer.from(chosenEntry[4]);
+		const privateKeyBytes = Buffer.from(chosenEntry[5]);
+		console.log(`[e2ee-qr] decryptKeyChain RESULT from entry[${matchedIdx}]: keyId=${chosenEntry[2]} privKey=${privateKeyBytes.toString("base64")} pubKey=${publicKeyBytes.toString("base64")} privLen=${privateKeyBytes.length} pubLen=${publicKeyBytes.length}`);
+		console.log(`[e2ee-qr] decryptKeyChain returning ${allEntries.length} total entries`);
+		return { matched: [privateKeyBytes, publicKeyBytes], allEntries };
 	}
 
 	public encryptDeviceSecret(
@@ -480,6 +708,7 @@ export class E2EE {
 			const privK = Buffer.from(groupK.privKey, "base64");
 			const pubK = Buffer.from(selfKeyData.pubKey, "base64");
 			receiverKeyId = groupK.keyId;
+			console.log(`[e2ee-diag] GROUP ENCRYPT: selfPubKey keyId=${selfKeyData.keyId} pub=${selfKeyData.pubKey} groupKeyId=${groupK.keyId}`);
 			keyData = this.generateSharedSecret(privK, pubK);
 		}
 		if (
@@ -695,11 +924,31 @@ export class E2EE {
 		this.e2eeLog("decryptE2EETextMessageSenderKeyId", senderKeyId);
 		this.e2eeLog("decryptE2EETextMessageReceiverKeyId", receiverKeyId);
 
-		const selfKey = await this.getE2EESelfKeyData(this.client.profile!.mid);
+		const isUserMsg = toType === LINETypes.enums.MIDType.USER || toType === "USER";
+
+		// USER (1-on-1): use keyId-based lookup — privKey is used directly in ECDH
+		//   and historical messages may have a different keyId than current.
+		// GROUP: use mid-based lookup — selfKey.privKey is NOT used in ECDH
+		//   (overridden by groupKey); selfKey.pubKey must match the sender's
+		//   mid-based key used during encryption.
+		let selfKey: LooseType;
+		if (isUserMsg) {
+			const myKeyId = isSelf ? senderKeyId : receiverKeyId;
+			selfKey = await this.getE2EESelfKeyDataByKeyId(myKeyId);
+			if (!selfKey) {
+				console.error(`[e2ee] decryptE2EETextMessage: e2eeKeys:${myKeyId} not found (isSelf=${isSelf} senderKeyId=${senderKeyId} receiverKeyId=${receiverKeyId})`);
+				throw new InternalError(
+					"NoE2EEKey",
+					`E2EE self key not found for keyId ${myKeyId} (isSelf=${isSelf} senderKeyId=${senderKeyId} receiverKeyId=${receiverKeyId})`,
+				);
+			}
+		} else {
+			selfKey = await this.getE2EESelfKeyData(this.client.profile!.mid);
+		}
 		let privK = Buffer.from(selfKey.privKey, "base64");
 		let pubK: LooseType;
 
-		if (toType === LINETypes.enums.MIDType.USER || toType === "USER") {
+		if (isUserMsg) {
 			pubK = await this.getE2EELocalPublicKey(
 				isSelf ? to : _from,
 				isSelf ? receiverKeyId : senderKeyId,
@@ -713,6 +962,9 @@ export class E2EE {
 			pubK = Buffer.from(selfKey.pubKey, "base64");
 			if (_from !== this.client.profile?.mid) {
 				pubK = await this.getE2EELocalPublicKey(_from, senderKeyId);
+				console.log(`[e2ee-diag] GROUP DECRYPT: senderPubKey mid=${_from} keyId=${senderKeyId} pub=${Buffer.from(pubK as Buffer).toString("base64")} groupKeyId=${groupK.keyId} groupKey=${groupK.privKey.slice(0, 16)}...`);
+			} else {
+				console.log(`[e2ee-diag] GROUP DECRYPT SELF: selfPubKey keyId=${selfKey.keyId} pub=${selfKey.pubKey} groupKeyId=${groupK.keyId}`);
 			}
 		}
 
@@ -753,6 +1005,11 @@ export class E2EE {
 	): Promise<Location> {
 		const _from = messageObj.from;
 		const to = messageObj.to;
+		if (_from === this.client.profile?.mid) {
+			isSelf = true;
+		} else {
+			isSelf = false;
+		}
 		const toType = messageObj.toType;
 		const metadata = messageObj.contentMetadata;
 		const specVersion = metadata.e2eeVersion || "2";
@@ -766,13 +1023,26 @@ export class E2EE {
 		this.e2eeLog("decryptE2EELocationMessageSenderKeyId", senderKeyId);
 		this.e2eeLog("decryptE2EELocationMessageReceiverKeyId", receiverKeyId);
 
-		const selfKey = await this.getE2EESelfKeyData(
-			this.client.profile?.mid as string,
-		);
+		const isUserMsg = toType === LINETypes.enums.MIDType.USER || toType === "USER";
+
+		let selfKey: LooseType;
+		if (isUserMsg) {
+			const myKeyId = isSelf ? senderKeyId : receiverKeyId;
+			selfKey = await this.getE2EESelfKeyDataByKeyId(myKeyId);
+			if (!selfKey) {
+				console.error(`[e2ee] decryptE2EELocationMessage: e2eeKeys:${myKeyId} not found (isSelf=${isSelf} senderKeyId=${senderKeyId} receiverKeyId=${receiverKeyId})`);
+				throw new InternalError(
+					"NoE2EEKey",
+					`E2EE self key not found for keyId ${myKeyId} (isSelf=${isSelf} senderKeyId=${senderKeyId} receiverKeyId=${receiverKeyId})`,
+				);
+			}
+		} else {
+			selfKey = await this.getE2EESelfKeyData(this.client.profile!.mid);
+		}
 		let privK = Buffer.from(selfKey.privKey, "base64");
 		let pubK: LooseType;
 
-		if (toType === LINETypes.enums.MIDType.USER || toType === "USER") {
+		if (isUserMsg) {
 			pubK = await this.getE2EELocalPublicKey(
 				to,
 				isSelf ? receiverKeyId : senderKeyId,
@@ -812,6 +1082,11 @@ export class E2EE {
 	): Promise<Record<string, LooseType>> {
 		const _from = messageObj.from;
 		const to = messageObj.to;
+		if (_from === this.client.profile?.mid) {
+			isSelf = true;
+		} else {
+			isSelf = false;
+		}
 		const toType = messageObj.toType;
 		const metadata = messageObj.contentMetadata;
 		const specVersion = metadata.e2eeVersion || "2";
@@ -827,13 +1102,26 @@ export class E2EE {
 		this.e2eeLog("decryptE2EEDataMessageSenderKeyId", senderKeyId);
 		this.e2eeLog("decryptE2EEDataMessageReceiverKeyId", receiverKeyId);
 
-		const selfKey = await this.getE2EESelfKeyData(
-			this.client.profile?.mid as string,
-		);
+		const isUserMsg = toType === LINETypes.enums.MIDType.USER || toType === "USER";
+
+		let selfKey: LooseType;
+		if (isUserMsg) {
+			const myKeyId = isSelf ? senderKeyId : receiverKeyId;
+			selfKey = await this.getE2EESelfKeyDataByKeyId(myKeyId);
+			if (!selfKey) {
+				console.error(`[e2ee] decryptE2EEDataMessage: e2eeKeys:${myKeyId} not found (isSelf=${isSelf} senderKeyId=${senderKeyId} receiverKeyId=${receiverKeyId})`);
+				throw new InternalError(
+					"NoE2EEKey",
+					`E2EE self key not found for keyId ${myKeyId} (isSelf=${isSelf} senderKeyId=${senderKeyId} receiverKeyId=${receiverKeyId})`,
+				);
+			}
+		} else {
+			selfKey = await this.getE2EESelfKeyData(this.client.profile!.mid);
+		}
 		let privK = Buffer.from(selfKey.privKey, "base64");
 		let pubK: LooseType;
 
-		if (toType === LINETypes.enums.MIDType.USER || toType === "USER") {
+		if (isUserMsg) {
 			pubK = await this.getE2EELocalPublicKey(
 				to,
 				isSelf ? receiverKeyId : senderKeyId,
@@ -865,6 +1153,7 @@ export class E2EE {
 			decrypted = this.decryptE2EEMessageV1(chunks, privK, pubK);
 		}
 
+		console.log(`[e2ee-decrypt-data] contentType=${contentType} isSelf=${isSelf} payload=${JSON.stringify(decrypted).slice(0, 200)}`);
 		return decrypted || {};
 	}
 
@@ -1024,6 +1313,7 @@ export class E2EE {
 			Buffer.from(publicKey).toString("base64"),
 		);
 		const version = 1;
+		console.log(`[e2ee-qr] createSqrSecret: secretKey(privKey)=${Buffer.from(secretKey).toString("base64").slice(0, 20)}... publicKey=${Buffer.from(publicKey).toString("base64").slice(0, 20)}... e2eeVersion=${version}`);
 
 		if (base64Only) {
 			return [

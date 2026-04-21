@@ -33,10 +33,11 @@ export class TalkService implements BaseService {
 			revision?: number | bigint;
 			globalRev?: number | bigint;
 			individualRev?: number | bigint;
+			fullSyncRequestReason?: string;
 			timeout?: number;
 		} = {},
 	): Promise<LINETypes.sync_result["success"]> {
-		const { limit, revision, individualRev, globalRev, timeout } = {
+		const { limit, revision, individualRev, globalRev, fullSyncRequestReason, timeout } = {
 			limit: 100,
 			revision: 0,
 			globalRev: 0,
@@ -51,6 +52,7 @@ export class TalkService implements BaseService {
 					lastGlobalRevision: globalRev,
 					lastIndividualRevision: individualRev,
 					count: limit,
+					...(fullSyncRequestReason ? { fullSyncRequestReason } : {}),
 				},
 			}),
 			"sync",
@@ -86,6 +88,7 @@ export class TalkService implements BaseService {
 		location?: LINETypes.Location;
 		chunks?: string[] | Buffer[];
 		e2ee?: boolean;
+		hasContent?: boolean;
 	}): Promise<LINETypes.Message> {
 		const {
 			to,
@@ -96,6 +99,7 @@ export class TalkService implements BaseService {
 			location,
 			e2ee,
 			chunks,
+			hasContent,
 		} = {
 			contentType: "NONE" as LINETypes.ContentType,
 			contentMetadata: {},
@@ -133,7 +137,7 @@ export class TalkService implements BaseService {
 				to,
 				createdTime: 0,
 				deliveredTime: 0,
-				hasContent: false,
+				hasContent: hasContent ?? false,
 				contentType,
 				contentMetadata,
 				sessionId: 0,
@@ -1497,6 +1501,18 @@ export class TalkService implements BaseService {
 		return await this.client.request.request(
 			LINEStruct.getPreviousMessagesV2WithRequest_args(...param),
 			"getPreviousMessagesV2WithRequest",
+			this.protocolType,
+			true,
+			this.requestPath,
+		);
+	}
+
+	async getRecentMessagesV2(
+		...param: Parameters<typeof LINEStruct.getRecentMessagesV2_args>
+	): Promise<LINETypes.getRecentMessagesV2_result["success"]> {
+		return await this.client.request.request(
+			LINEStruct.getRecentMessagesV2_args(...param),
+			"getRecentMessagesV2",
 			this.protocolType,
 			true,
 			this.requestPath,

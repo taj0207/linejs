@@ -258,6 +258,11 @@ export class LineObs {
 			headers = { ...headers, ...addHeaders };
 		}
 
+		this.client.log("Obs.uploadObjectForService", {
+			obsPath: obsPathFinal,
+			dataSize: data.size,
+			params,
+		});
 		const response = await this.client.fetch(
 			this.prefix + obsPathFinal,
 			{ method: "POST", headers, body: data },
@@ -265,11 +270,11 @@ export class LineObs {
 
 		const objId = response.headers.get("x-obs-oid") ?? "";
 		const objHash = response.headers.get("x-obs-hash") ?? "";
-		this.client.log("Obs.uploadObjectForServiceResponse", {
-			objId,
-			objHash,
-			headers: response.headers.toString(),
-		});
+		const status = response.status;
+		console.log(`[obs-upload] path=${obsPathFinal} status=${status} dataSize=${data.size} objId=${objId} objHash=${objHash}`);
+		if (!objId) {
+			console.error(`[obs-upload] WARNING: empty objId returned! path=${obsPathFinal} status=${status}`);
+		}
 
 		return { objId, objHash, headers: response.headers };
 	}
@@ -305,8 +310,12 @@ export class LineObs {
 		oType: ObjType;
 		to: string;
 		filename?: string;
+		duration?: string;
+		fileSize?: number;
+		width?: number;
+		height?: number;
 	}): Promise<Message> {
-		const { data, oType, to, filename } = options;
+		const { data, oType, to, filename, duration, fileSize, width, height } = options;
 		const typeSet: {
 			image: [string, 1];
 			video: [string, 2];
@@ -331,6 +340,8 @@ export class LineObs {
 		if (oType === "gif") {
 			params["cat"] = "original";
 		}
+		// Note: duration is only set in contentMetadata (DURATION field), not in OBS params
+		// OBS params with duration may cause LINE app to process the encrypted data differently
 		if (!(to[0] === "u" || to[0] === "c")) {
 			throw new InternalError("ObsError", "Invalid mid");
 		}
@@ -366,34 +377,38 @@ export class LineObs {
 			}
 		}
 
+		const dataPayload: Record<string, unknown> = {
+			keyMaterial,
+			fileName: filename || "line." + ext,
+			...(fileSize ? { fileSize } : {}),
+			...(width ? { width } : {}),
+			...(height ? { height } : {}),
+		};
 		const chunks = await this.client.e2ee.encryptE2EEMessage(
 			to,
-			{ keyMaterial, fileName: filename || "line." + ext },
+			dataPayload,
 			contentType,
 		);
+		const chunkSizes = chunks.map((c: Buffer) => c.length);
+		console.log(`[e2ee-upload] oType=${oType} contentType=${contentType} chunks: count=${chunks.length} sizes=${JSON.stringify(chunkSizes)} dataPayload=${JSON.stringify(dataPayload).slice(0, 120)}`);
 
-		return await this.client.talk.sendMessage({
-			to,
-			chunks,
-			contentType: contentType,
-			contentMetadata: {
+		const outMeta: Record<string, string> = {
 				SID: obsNamespace,
 				OID: objId,
 				FILE_SIZE: edata.size.toString(),
 				e2eeVersion: "2",
-				...(oType === "image" || oType === "gif" || oType === "video")
-					? {
-						MEDIA_CONTENT_INFO: JSON.stringify(
-							{
-								category: "original",
-								fileSize: edata.size,
-								extension: ext,
-								animated: oType == "gif",
-							},
-						),
-					}
-					: {},
-			},
+				e2eeMark: "2",
+				contentType: contentType.toString(),
+				...(duration ? { DURATION: duration } : {}),
+				...(width && height ? { MEDIA_THUMB_INFO: JSON.stringify({ width, height }) } : {}),
+		};
+		this.client.log("uploadMediaByE2EE.sendMessage", { oType, contentType, obsNamespace, objId, ext, outMeta });
+		return await this.client.talk.sendMessage({
+			to,
+			chunks,
+			hasContent: true,
+			contentType: contentType,
+			contentMetadata: outMeta,
 		});
 	}
 

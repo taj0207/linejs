@@ -132,7 +132,7 @@ export class Chat {
 	 */
 	async fetchMessages(limit: number = 10): Promise<TalkMessage[]> {
 		const boxes = await this.#client.base.talk.getMessageBoxes({
-			messageBoxListRequest: {},
+			messageBoxListRequest: { activeOnly: false },
 		});
 		const box = boxes.messageBoxes.find((box) => box.id === this.mid);
 		if (!box) {

@@ -8,6 +8,7 @@ import {
 } from "./connData.ts";
 import type { ConnManager, ReadableStreamWriter } from "./connManager.ts";
 import type { LooseType } from "@evex/loose-types";
+import * as http2 from "node:http2";
 
 export class Conn {
 	manager: ConnManager;
@@ -20,6 +21,10 @@ export class Conn {
 	resStream?: ReadableStream<Uint8Array>;
 	private _lastSendTime = 0;
 	private _closed = false;
+
+	// node:http2 native stream
+	private _h2Session?: http2.ClientHttp2Session;
+	private _h2Stream?: http2.ClientHttp2Stream;
 
 	constructor(manager: ConnManager) {
 		this.manager = manager;
@@ -106,27 +111,84 @@ export class Conn {
 		path: string,
 		headers: Record<string, string> = {},
 	) {
-		const bodystream = this.createAsyncReadableStream();
 		const abort = new AbortController();
-		await new Promise<void>((resolve) => {
-			(async () => {
-				const socket = await this.client.fetch(`https://${host}${path}`, {
-					method: "POST",
-					headers,
-					body: bodystream.stream,
-					signal: abort.signal,
-					// @ts-expect-error: https://github.com/evex-dev/linejs/issues/109
-					duplex: "half"
-				});
-				if (!socket.body) {
-					throw new Error("no body");
-				}
-				this.resStream = socket.body;
-				resolve();
-			})();
-			setTimeout(resolve, 300);
+
+		// 用 node:http2 建立真正的 HTTP/2 連線
+		const h2Session = http2.connect(`https://${host}`);
+		this._h2Session = h2Session;
+
+		h2Session.on("error", (err: LooseType) => {
+			this.manager.log(`[H2] session error: ${err?.message || err}`);
 		});
-		this.reqStream = { ...bodystream, abort };
+
+		// 等待連線建立
+		await new Promise<void>((resolve, reject) => {
+			h2Session.once("connect", () => resolve());
+			h2Session.once("error", (err: LooseType) => reject(err));
+			setTimeout(() => resolve(), 3000); // 3s timeout
+		});
+
+		// 建立 HTTP/2 stream (不結束 request body，保持雙向 streaming)
+		const h2Headers: http2.OutgoingHttpHeaders = {
+			":method": "POST",
+			":path": path,
+			...headers,
+		};
+		const h2Stream = h2Session.request(h2Headers, { endStream: false });
+		this._h2Stream = h2Stream;
+
+		// 把 h2Stream 的 data 事件轉成 ReadableStream 供 read() 使用
+		let resController: ReadableStreamDefaultController<Uint8Array> | null = null;
+		this.resStream = new ReadableStream<Uint8Array>({
+			start(c) {
+				resController = c;
+			},
+			cancel() {
+				resController = null;
+				h2Stream.close();
+			},
+		});
+
+		h2Stream.on("data", (chunk: Buffer) => {
+			if (resController) {
+				resController.enqueue(new Uint8Array(chunk));
+			}
+		});
+
+		h2Stream.on("end", () => {
+			if (resController) {
+				resController.close();
+				resController = null;
+			}
+		});
+
+		h2Stream.on("error", (err: LooseType) => {
+			this.manager.log(`[H2] stream error: ${err?.message || err}`);
+			if (resController) {
+				resController.error(err);
+				resController = null;
+			}
+		});
+
+		// 建立 reqStream adapter，讓 writeByte 可以寫入 h2Stream
+		const bodystream = this.createAsyncReadableStream();
+		this.reqStream = {
+			...bodystream,
+			abort,
+			enqueue: (chunk: string | Uint8Array) => {
+				const data = typeof chunk === "string"
+					? new TextEncoder().encode(chunk)
+					: chunk;
+				if (this._h2Stream && !this._closed) {
+					this._h2Stream.write(Buffer.from(data));
+				}
+			},
+			close: () => {
+				if (this._h2Stream) {
+					this._h2Stream.end();
+				}
+			},
+		};
 	}
 
 	async writeByte(data: Uint8Array) {
@@ -303,7 +365,14 @@ export class Conn {
 		await 0;
 		this._closed = true;
 		try {
-			this.reqStream?.close();
+			if (this._h2Stream) {
+				this._h2Stream.close();
+				this._h2Stream = undefined;
+			}
+			if (this._h2Session) {
+				this._h2Session.close();
+				this._h2Session = undefined;
+			}
 			this.reqStream?.abort.abort();
 		} catch (_e) {
 			// ignore

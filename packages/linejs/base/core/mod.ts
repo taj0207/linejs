@@ -223,6 +223,12 @@ export class BaseClient extends TypedEventEmitter<ClientEvents> {
 		info: RequestInfo | URL,
 		init?: RequestInit,
 	): Promise<Response> => {
+		// ReadableStream body は new Request() に渡すと消費されるため、
+		// streaming body がある場合は globalThis.fetch に直接渡す
+		// (new Request() は body stream を消費してしまい PUSH 接続が失敗する)
+		if (init?.body instanceof ReadableStream) {
+			return globalThis.fetch(info as RequestInfo, init);
+		}
 		const req = new Request(info, init);
 		const res =
 			await (this.#customFetch

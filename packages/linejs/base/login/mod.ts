@@ -194,16 +194,21 @@ export class Login {
 				await this.checkPinCodeVerified(sqr);
 			}
 			const response = await this.qrCodeLogin(sqr);
+			console.log(`[e2ee-qr] requestSQR: qrCodeLogin response fields: ${JSON.stringify(Object.keys(response))}`);
 			const { 1: pem, 2: authToken, 4: e2eeInfo, 5: _mid } = response;
+			console.log(`[e2ee-qr] requestSQR: hasPem=${!!pem} hasAuthToken=${!!authToken} hasE2eeInfo=${!!e2eeInfo} mid=${_mid}`);
 			if (pem) {
 				this.client.emit("update:qrcert", pem);
 				await this.registerQrCert(pem);
 			}
 			if (e2eeInfo) {
+				console.log(`[e2ee-qr] requestSQR: e2eeInfo fields: ${JSON.stringify(Object.keys(e2eeInfo))}`);
 				await this.client.e2ee.decodeE2EEKeyV1(
 					e2eeInfo,
 					Buffer.from(secret),
 				);
+			} else {
+				console.log(`[e2ee-qr] requestSQR: NO e2eeInfo in response!`);
 			}
 			return authToken;
 		}
@@ -228,16 +233,21 @@ export class Login {
 				await this.checkPinCodeVerified(sqr);
 			}
 			const response = await this.qrCodeLoginV2(sqr);
+			console.log(`[e2ee-qr] requestSQR2: qrCodeLoginV2 response fields: ${JSON.stringify(Object.keys(response))}`);
 			const { 1: pem, 3: tokenInfo, 4: _mid, 10: e2eeInfo } = response;
+			console.log(`[e2ee-qr] requestSQR2: hasPem=${!!pem} hasMid=${!!_mid} hasE2eeInfo=${!!e2eeInfo} mid=${_mid}`);
 			if (pem) {
 				this.client.emit("update:qrcert", pem);
 				await this.registerQrCert(pem);
 			}
 			if (e2eeInfo) {
+				console.log(`[e2ee-qr] requestSQR2: e2eeInfo fields: ${JSON.stringify(Object.keys(e2eeInfo))}`);
 				await this.client.e2ee.decodeE2EEKeyV1(
 					e2eeInfo,
 					Buffer.from(secret),
 				);
+			} else {
+				console.log(`[e2ee-qr] requestSQR2: NO e2eeInfo in response!`);
 			}
 			await this.client.storage.set("refreshToken", tokenInfo[2]);
 			await this.client.storage.set(

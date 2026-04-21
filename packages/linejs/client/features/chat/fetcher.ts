@@ -8,7 +8,7 @@ export interface MessageFetcher {
 }
 export const createMessageFetcher = async (client: Client, chat: Chat) => {
 	const boxes = await client.base.talk.getMessageBoxes({
-		messageBoxListRequest: {},
+		messageBoxListRequest: { activeOnly: false },
 	});
 	const box = boxes.messageBoxes.find((box) => box.id === chat.mid);
 	if (!box) {
