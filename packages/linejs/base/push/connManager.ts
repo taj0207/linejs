@@ -50,6 +50,10 @@ export class ConnManager {
 	onPushResponse: (frame: LegyH2PushFrame) => void;
 	_eventSynced = false;
 	_pingInterval = 30;
+	// Timestamp (ms) of the last server ping. The push read() blocks for the
+	// whole connection lifetime, so without a ping watchdog a half-open socket
+	// hangs read() until the OS TCP timeout (many minutes). See InitAndRead.
+	_lastPingAt = 0;
 	authToken: string | null = null;
 	subscriptionId: number = 0;
 
@@ -468,6 +472,7 @@ export class ConnManager {
 
 	_OnPingCallback(pingId: number) {
 		this.currPingId = pingId;
+		this._lastPingAt = Date.now(); // feeds the InitAndRead ping watchdog
 		const t1 = Date.now() / 1000;
 		const refreshIds: number[] = [];
 		for (const k of Object.keys(this.subscriptionIds)) {
@@ -540,7 +545,28 @@ export class ConnManager {
 		}
 
 		this.log("CONN start read push.");
-		const readResult = await _conn.read();
+		// Ping watchdog: the server pings every _pingInterval seconds. read()
+		// blocks for the whole connection lifetime, so if pings stop (half-open
+		// socket) it would otherwise hang until the OS TCP timeout — minutes of
+		// silently-missed messages. Force-close the conn once pings go stale so
+		// read() returns and initLegyPusher reconnects within ~3 ping intervals.
+		this._lastPingAt = Date.now();
+		const staleMs = this._pingInterval * 1000 * 3;
+		const watchdog = setInterval(() => {
+			if (Date.now() - this._lastPingAt > staleMs) {
+				this.log(
+					`ping watchdog: no ping for >${staleMs / 1000}s — closing dead conn`,
+				);
+				try {
+					_conn.close();
+				} catch {
+					/* already gone */
+				}
+			}
+		}, this._pingInterval * 1000);
+		const readResult = await _conn.read().finally(() =>
+			clearInterval(watchdog)
+		);
 		this.log(`CONN died on PingId=${this.currPingId}`, readResult);
 		const idx = this.conns.indexOf(_conn);
 		if (idx >= 0) this.conns.splice(idx, 1);
