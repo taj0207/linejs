@@ -237,6 +237,34 @@ export class RequestClient {
 		}
 		if (hasError && !isRefresh) {
 			if (res.data.e.code === "NOT_AUTHORIZED_DEVICE") {
+				// Before giving up, try one token refresh — the same recovery LINE
+				// uses for MUST_REFRESH_V3_TOKEN. A sub-device access token can
+				// hard-expire (NOT_AUTHORIZED_DEVICE/EXPIRED) ~once a day; if the
+				// refreshToken is still valid this keeps the session alive without a
+				// full re-login. Skip when this IS the refresh call (avoid recursion)
+				// or we already retried once.
+				if (
+					!isReRequest &&
+					methodName !== "refresh" &&
+					typeof (await this.client.storage.get("refreshToken")) ===
+						"string"
+				) {
+					try {
+						await this.client.auth.tryRefreshToken();
+						return this.requestCore(
+							path,
+							value,
+							methodName,
+							protocolType,
+							appendHeaders,
+							overrideMethod,
+							parse,
+							true,
+						);
+					} catch (_e) {
+						// refresh also failed (refreshToken expired too) → give up below.
+					}
+				}
 				delete this.client.authToken;
 				this.client.emit("end", this.client.profile!);
 			}
