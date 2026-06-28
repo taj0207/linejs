@@ -154,9 +154,16 @@ export class TMoreCompactProtocol {
 			const encoded = this.readVarint();
 			value = this.decodeZigZag(encoded);
 		} else if (typeId === 10) {
-			// I64 (zigzag varint)
-			const encoded = this.readVarint();
-			value = this.decodeZigZag(encoded);
+			// I64 (zigzag varint) — decode in BigInt so 19-digit message ids keep
+			// full precision. decodeZigZag returns Number, which rounds the low
+			// digits and broke reply matching (a live reply's relatedMessageId no
+			// longer equalled a history-loaded message's id). Return a Number only
+			// when it fits safely, matching read.ts's bigInt().
+			const encoded = BigInt(this.readVarint());
+			const zigzag = (encoded >> 1n) * ((encoded & 1n) ? -1n : 1n);
+			value = (zigzag >= -9007199254740991n && zigzag <= 9007199254740991n)
+				? Number(zigzag)
+				: zigzag;
 		} else if (typeId === 11) {
 			// STRING
 			value = this.readString();
