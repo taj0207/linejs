@@ -154,7 +154,12 @@ export class RequestClient {
 			},
 		);
 		const nextToken = response.headers.get("x-line-next-access");
-		if (nextToken) {
+		if (nextToken && nextToken !== this.client.authToken) {
+			// LINE rotates the access token via this header on each response. Use
+			// the new one for subsequent requests (the official clients do this) —
+			// otherwise we keep sending the original login token until it hits its
+			// hard expiry (~daily NOT_AUTHORIZED_DEVICE/EXPIRED on sub-devices).
+			this.client.authToken = nextToken;
 			this.client.emit("update:authtoken", nextToken);
 		}
 		const body = await response.arrayBuffer();
