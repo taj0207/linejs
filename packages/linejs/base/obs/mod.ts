@@ -392,6 +392,8 @@ export class LineObs {
 		const chunkSizes = chunks.map((c: Buffer) => c.length);
 		console.log(`[e2ee-upload] oType=${oType} contentType=${contentType} chunks: count=${chunks.length} sizes=${JSON.stringify(chunkSizes)} dataPayload=${JSON.stringify(dataPayload).slice(0, 120)}`);
 
+		const isVisual = oType === "image" || oType === "gif" ||
+			oType === "video";
 		const outMeta: Record<string, string> = {
 				SID: obsNamespace,
 				OID: objId,
@@ -400,6 +402,20 @@ export class LineObs {
 				e2eeMark: "2",
 				contentType: contentType.toString(),
 				...(duration ? { DURATION: duration } : {}),
+				// The LINE app needs MEDIA_CONTENT_INFO to render an E2EE
+				// image/gif/video — without it the message arrives but shows as a
+				// blank/unopenable bubble ("sent but the other side can't see it").
+				...(isVisual
+					? {
+						MEDIA_CONTENT_INFO: JSON.stringify({
+							category: "original",
+							fileSize: edata.size,
+							extension: ext,
+							animated: oType === "gif",
+							...(width && height ? { width, height } : {}),
+						}),
+					}
+					: {}),
 				...(width && height ? { MEDIA_THUMB_INFO: JSON.stringify({ width, height }) } : {}),
 		};
 		this.client.log("uploadMediaByE2EE.sendMessage", { oType, contentType, obsNamespace, objId, ext, outMeta });
